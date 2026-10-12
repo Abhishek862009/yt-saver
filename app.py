@@ -142,6 +142,13 @@ BASE_OPTS = {
     "concurrent_fragment_downloads": 4,
     "http_chunk_size": 10 * 1024 * 1024,  # avoids YouTube throttling
 }
+# yt-dlp needs a JavaScript runtime to solve YouTube's challenges.
+# Its default is only deno, so also enable node if it is installed.
+_runtimes = {n: {} for n in ("deno", "node") if shutil.which(n)}
+if _runtimes:
+    BASE_OPTS["js_runtimes"] = _runtimes
+else:
+    print("WARNING: no JavaScript runtime (deno/node) found - YouTube downloads will likely fail.", flush=True)
 _info_cache, _info_lock = {}, threading.Lock()
 
 
@@ -165,6 +172,7 @@ def info():
         with yt_dlp.YoutubeDL({**BASE_OPTS, "skip_download": True}) as ydl:
             d = ydl.extract_info(url, download=False)
     except Exception:
+        import traceback; traceback.print_exc()
         return jsonify(error="Couldn't read this video. It may be private, or yt-dlp needs an update."), 422
 
     formats = d.get("formats", [])
@@ -212,11 +220,13 @@ def video_format(h):
 
 
 def friendly_error(e):
+    print("yt-dlp error:", e, flush=True)  # real cause shows in the server log
     t = str(e).lower()
     if "ffmpeg" in t or "ffprobe" in t:
         return "ffmpeg is missing. In Termux run: pkg install ffmpeg"
     if "sign in" in t or "bot" in t or "403" in t:
-        return "YouTube blocked this request. Update yt-dlp (pip install -U yt-dlp) and try again."
+        return ("YouTube blocked this request. Check the server log for the real error. "
+                "Usual causes: no JavaScript runtime (install nodejs), outdated yt-dlp, or a blocked server IP.")
     if "no space" in t:
         return "Phone storage is full."
     return "Download failed. Update yt-dlp (pip install -U yt-dlp), then try again."
