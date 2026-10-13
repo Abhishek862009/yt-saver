@@ -2,6 +2,7 @@ import glob
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -9,7 +10,7 @@ import threading
 import time
 from datetime import timedelta
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 from flask import Flask, jsonify, redirect, request, send_file, send_from_directory, session
@@ -28,7 +29,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Strict",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
-    MAX_CONTENT_LENGTH=4096,
+    MAX_CONTENT_LENGTH=64 * 1024,  # room for a playlist batch request
 )
 if os.environ.get("BEHIND_PROXY") == "1":  # only trust X-Forwarded-For behind a real proxy
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
@@ -133,7 +134,7 @@ def home():
 # ---------------- Video info (cached) ----------------
 BASE_OPTS = {
     "quiet": True,
-    "no_warnings": True,
+    "no_warnings": False,  # keep warnings: they explain slow/throttled downloads
     "noplaylist": True,
     "noprogress": True,
     "retries": 10,
@@ -168,9 +169,11 @@ def info():
     if hit and time.time() - hit[0] < 600:
         return jsonify(hit[1])
 
+    t_info = time.time()
     try:
         with yt_dlp.YoutubeDL({**BASE_OPTS, "skip_download": True}) as ydl:
             d = ydl.extract_info(url, download=False)
+        print(f"[timing] info extraction took {time.time() - t_info:.1f}s", flush=True)
     except Exception:
         import traceback; traceback.print_exc()
         return jsonify(error="Couldn't read this video. It may be private, or yt-dlp needs an update."), 422
@@ -232,8 +235,10 @@ def friendly_error(e):
     return "Download failed. Update yt-dlp (pip install -U yt-dlp), then try again."
 
 
-def run_job(job):
+def run_job(job, release_slot=True):
     streams = {}
+    t0 = time.time()
+    last_speed = {"v": 0}
 
     def hook(d):
         if job["cancel"]:
@@ -246,12 +251,16 @@ def run_job(job):
             if total:
                 job["percent"] = min(99.0, done * 100.0 / total)
             job["speed"] = d.get("speed") or 0
+            last_speed["v"] = job["speed"] or last_speed["v"]
             job["eta"] = d.get("eta")
         elif d["status"] == "finished":
             n = d.get("downloaded_bytes") or d.get("total_bytes") or 0
             streams[key] = (n, n)
+            print(f"[timing] stream finished at +{time.time() - t0:.1f}s: {n / 1048576:.1f} MiB, "
+                  f"last speed {last_speed['v'] / 1048576:.2f} MiB/s", flush=True)
 
     def pp_hook(d):
+        print(f"[timing] {d.get('postprocessor')} {d['status']} at +{time.time() - t0:.1f}s", flush=True)
         if d["status"] == "started":
             job["state"], job["speed"], job["eta"] = "merging", 0, None
 
@@ -275,7 +284,8 @@ def run_job(job):
         if not files:
             raise RuntimeError("no file produced")
         path = max(files, key=os.path.getsize)
-        job.update(path=path, filename=os.path.basename(path), percent=100.0, state="done")
+        job.update(path=path, filename=os.path.basename(path), percent=100.0, state="done", created=time.time())
+        print(f"[timing] job done at +{time.time() - t0:.1f}s, file {os.path.getsize(path) / 1048576:.1f} MiB", flush=True)
     except Exception as e:
         if job["cancel"]:
             job["state"] = "cancelled"
@@ -283,7 +293,21 @@ def run_job(job):
             job.update(state="error", error=friendly_error(e))
         shutil.rmtree(job["dir"], ignore_errors=True)
     finally:
-        _slots.release()
+        if release_slot:
+            _slots.release()
+
+
+def valid_quality(q):
+    return q == "audio" or (q.isdigit() and 100 <= int(q) <= 4320)
+
+
+def make_job(url, quality, expected=0):
+    jid = secrets.token_urlsafe(12)
+    return dict(
+        id=jid, url=url, quality=quality, state="queued", percent=0.0, speed=0, eta=None,
+        error="", path="", filename="", cancel=False, created=time.time(),
+        expected=expected, dir=tempfile.mkdtemp(prefix="ytsaver_"),
+    )
 
 
 @app.post("/api/start")
@@ -293,22 +317,151 @@ def start():
     url, quality = str(body.get("url", "")).strip(), str(body.get("quality", ""))
     if not is_valid(url):
         return jsonify(error="Invalid link."), 400
-    if not (quality == "audio" or (quality.isdigit() and 100 <= int(quality) <= 4320)):
+    if not valid_quality(quality):
         return jsonify(error="Invalid quality."), 400
     if not _slots.acquire(blocking=False):
         return jsonify(error="Two downloads are already running. Wait for one to finish."), 429
 
-    jid = secrets.token_urlsafe(12)
-    job = dict(
-        id=jid, url=url, quality=quality, state="queued", percent=0.0, speed=0, eta=None,
-        error="", path="", filename="", cancel=False, created=time.time(),
-        expected=int(body.get("expected") or 0) if str(body.get("expected") or "0").isdigit() else 0,
-        dir=tempfile.mkdtemp(prefix="ytsaver_"),
-    )
+    expected = int(body.get("expected") or 0) if str(body.get("expected") or "0").isdigit() else 0
+    job = make_job(url, quality, expected)
+    jid = job["id"]
     with JOBS_LOCK:
         JOBS[jid] = job
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return jsonify(id=jid)
+
+
+# ---------------- Playlists ----------------
+PL_MAX = 100  # max videos per playlist (protects the phone's storage and time)
+VID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+LIST_RE = re.compile(r"[A-Za-z0-9_-]{10,64}")
+_pl_cache, _pl_lock = {}, threading.Lock()
+
+
+@app.post("/api/playlist")
+@login_required(api=True)
+def playlist():
+    url = str((request.get_json(silent=True) or {}).get("url", "")).strip()
+    if not is_valid(url):
+        return jsonify(error="Paste a valid YouTube link."), 400
+    lid = (parse_qs(urlparse(url).query).get("list") or [""])[0]
+    if not LIST_RE.fullmatch(lid):
+        return jsonify(error="No playlist found in this link."), 400
+
+    with _pl_lock:
+        hit = _pl_cache.get(lid)
+    if hit and time.time() - hit[0] < 600:
+        return jsonify(hit[1])
+
+    opts = {**BASE_OPTS, "skip_download": True, "noplaylist": False, "extract_flat": "in_playlist",
+            "playlistend": PL_MAX, "ignoreerrors": True}
+    t0 = time.time()
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            d = ydl.extract_info(f"https://www.youtube.com/playlist?list={lid}", download=False)
+    except Exception:
+        import traceback; traceback.print_exc()
+        d = None
+    if not d:
+        return jsonify(error="Couldn't read this playlist. It may be private, or yt-dlp needs an update."), 422
+    print(f"[timing] playlist listing took {time.time() - t0:.1f}s", flush=True)
+
+    videos = []
+    for e in d.get("entries") or []:
+        if not e:
+            continue
+        vid, title = str(e.get("id") or ""), str(e.get("title") or "")
+        if not VID_RE.fullmatch(vid) or title in ("[Private video]", "[Deleted video]"):
+            continue  # skip unavailable entries
+        videos.append(dict(id=vid, title=title or vid, duration=e.get("duration") or 0,
+                           thumb=f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"))
+    if not videos:
+        return jsonify(error="This playlist has no downloadable videos."), 422
+    total = d.get("playlist_count") or len(videos)
+    data = dict(title=d.get("title") or "Playlist", channel=d.get("uploader") or d.get("channel") or "",
+                videos=videos, total=total, truncated=total > len(videos) and len(videos) >= PL_MAX)
+    with _pl_lock:
+        if len(_pl_cache) > 20:
+            _pl_cache.clear()
+        _pl_cache[lid] = (time.time(), data)
+    return jsonify(data)
+
+
+BATCHES = {}
+
+
+def run_batch(batch):
+    try:
+        for item in batch["items"]:
+            if batch["cancel"]:
+                item["state"] = "cancelled"
+                continue
+            job = make_job(item["url"], item["quality"])
+            job["cancel"] = batch["cancel"]
+            item["jid"] = job["id"]
+            with JOBS_LOCK:
+                JOBS[job["id"]] = job
+            run_job(job, release_slot=False)  # one video at a time
+    finally:
+        batch["state"] = "cancelled" if batch["cancel"] else "done"
+        _slots.release()
+
+
+@app.post("/api/batch/start")
+@login_required(api=True)
+def batch_start():
+    raw = (request.get_json(silent=True) or {}).get("items")
+    if not isinstance(raw, list) or not raw or len(raw) > PL_MAX:
+        return jsonify(error=f"Choose between 1 and {PL_MAX} videos."), 400
+    items = []
+    for r in raw:
+        r = r if isinstance(r, dict) else {}
+        vid, quality = str(r.get("id", "")), str(r.get("quality", ""))
+        if not VID_RE.fullmatch(vid) or not valid_quality(quality):
+            return jsonify(error="Invalid video or quality."), 400
+        items.append(dict(url=f"https://www.youtube.com/watch?v={vid}", quality=quality,
+                          title=str(r.get("title", ""))[:200], jid="", state="waiting"))
+    if not _slots.acquire(blocking=False):
+        return jsonify(error="Two downloads are already running. Wait for one to finish."), 429
+    bid = secrets.token_urlsafe(12)
+    batch = dict(id=bid, items=items, state="running", cancel=False, created=time.time())
+    BATCHES[bid] = batch
+    threading.Thread(target=run_batch, args=(batch,), daemon=True).start()
+    return jsonify(id=bid)
+
+
+@app.get("/api/batch/<bid>")
+@login_required(api=True)
+def batch_status(bid):
+    batch = BATCHES.get(bid)
+    if not batch:
+        return jsonify(error="Batch expired. Start again."), 404
+    out = []
+    for it in batch["items"]:
+        row = dict(title=it["title"], jid=it["jid"], state=it["state"], percent=0, speed=0, eta=None,
+                   error="", filename="")
+        if it["jid"]:
+            job = JOBS.get(it["jid"])
+            if job:
+                row.update(state=job["state"], percent=round(job["percent"], 1), speed=job["speed"],
+                           eta=job["eta"], error=job["error"], filename=job["filename"])
+            else:
+                row["state"] = "expired"
+        out.append(row)
+    return jsonify(state=batch["state"], items=out)
+
+
+@app.post("/api/batch/<bid>/cancel")
+@login_required(api=True)
+def batch_cancel(bid):
+    batch = BATCHES.get(bid)
+    if batch:
+        batch["cancel"] = True
+        for it in batch["items"]:
+            job = JOBS.get(it["jid"]) if it["jid"] else None
+            if job and job["state"] in ("queued", "downloading", "merging"):
+                job["cancel"] = True
+    return jsonify(ok=True)
 
 
 @app.get("/api/status/<jid>")
@@ -344,9 +497,12 @@ def janitor():
         time.sleep(60)
         now = time.time()
         with JOBS_LOCK:
-            for jid in [j for j, v in JOBS.items() if now - v["created"] > JOB_TTL and v["state"] != "downloading"]:
+            for jid in [j for j, v in JOBS.items()
+                        if now - v["created"] > JOB_TTL and v["state"] not in ("queued", "downloading", "merging")]:
                 shutil.rmtree(JOBS[jid]["dir"], ignore_errors=True)
                 JOBS.pop(jid, None)
+            for bid in [b for b, v in BATCHES.items() if v["state"] != "running" and now - v["created"] > 6 * 3600]:
+                BATCHES.pop(bid, None)
 
 
 threading.Thread(target=janitor, daemon=True).start()
