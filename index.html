@@ -100,7 +100,6 @@
   .pl-row.error .pl-sub { color:var(--error); font-weight:600; }
   #pdl { width:100%; margin-top:16px; background:var(--cobalt); border-color:var(--cobalt); font-size:1.05rem; }
   .linkbtn { background:none; border:0; padding:0; color:var(--cobalt); font:inherit; font-weight:600; text-decoration:underline; }
-  .logout { position:fixed; top:14px; right:16px; background:none; border:0; color:var(--muted); font-weight:600; padding:8px; }
   .note { margin-top:36px; font-size:.82rem; color:var(--muted); max-width:60ch; }
   @media (max-width:480px) {
     .field { flex-direction:column; }
@@ -112,7 +111,6 @@
 </style>
 </head>
 <body>
-<button id="logout" class="logout">Log out</button>
 <main>
   <h1>Save a video.<br>Pick the quality.</h1>
   <p class="lead">Paste a YouTube link, choose a resolution from highest to lowest, and save it to your device.</p>
@@ -173,20 +171,21 @@
     </div>
   </section>
 
+  <p id="limits" class="note" hidden></p>
   <p class="note">Only save videos you own, that are licensed for reuse, or that you have permission to download. Downloading others' videos may break YouTube's Terms of Service or copyright law.</p>
 </main>
 
 <script>
+  const BASE = (location.pathname === "/yt-saver" || location.pathname.startsWith("/yt-saver/")) ? "/yt-saver" : "";  // served at arvish.xyz/yt-saver, or at / when run on its own
   const $ = (id) => document.getElementById(id);
   const urlInput = $("url"), checkBtn = $("check"), saveBtn = $("save"), msg = $("msg");
-  let currentUrl = "", selected = null, expected = {}, jobId = null, polling = false;
+  let currentUrl = "", selected = null, expected = {}, jobId = null, polling = false, publicMode = false;
 
   const say = (t, err = false) => { msg.textContent = t; msg.className = "msg" + (err ? " error" : ""); };
   const fmtSize = (b) => !b ? "—" : (b / 1048576 >= 1024 ? (b / 1073741824).toFixed(1) + " GB" : Math.round(b / 1048576) + " MB");
   const fmtTime = (s) => { s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
     return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
   const tag = (h) => h >= 2160 ? "4K" : h >= 1440 ? "2K" : h >= 720 ? "HD" : "";
-  const toLogin = () => { location.href = "/login"; };
 
   function select(value) {
     selected = value;
@@ -208,13 +207,14 @@
     const url = urlInput.value.trim();
     if (!url) return say("Paste a YouTube link first.", true);
     let u = null; try { u = new URL(url); } catch (e) {}
-    if (u && u.pathname.startsWith("/playlist")) return loadPlaylist(url);   // a pure playlist link
+    if (u && u.pathname.startsWith("/playlist")) {   // a pure playlist link
+      return publicMode ? say("Playlists are not available in the free version. Paste a single video link.", true) : loadPlaylist(url);
+    }
     $("plist").hidden = true; $("plhint").hidden = true;
     checkBtn.disabled = true; $("result").hidden = true; $("skel").hidden = false;
     say("Reading video…");
     try {
-      const r = await fetch("/api/info", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
-      if (r.status === 401) return toLogin();
+      const r = await fetch(BASE + "/api/info", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Something went wrong.");
 
@@ -231,7 +231,7 @@
 
       select(d.qualities.length ? d.qualities[0].height : "audio");
       resetProgress();
-      $("plhint").hidden = !(u && u.searchParams.get("list"));   // video link that also has a playlist
+      $("plhint").hidden = publicMode || !(u && u.searchParams.get("list"));   // video link that also has a playlist
       $("result").hidden = false; say("");
     } catch (e) { say(e.message, true); }
     finally { checkBtn.disabled = false; $("skel").hidden = true; }
@@ -253,9 +253,8 @@
     $("again").hidden = true; $("cancel").hidden = false; $("cancel").disabled = false;
     setProgress("Starting…", 0, "Getting things ready");
     try {
-      const r = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json" },
+      const r = await fetch(BASE + "/api/start", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: currentUrl, quality: String(selected), expected: expected[selected] || 0 }) });
-      if (r.status === 401) return toLogin();
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Could not start.");
       jobId = d.id; polling = true; poll(0);
@@ -271,8 +270,7 @@
   async function poll(errors) {
     if (!polling || !jobId) return;
     try {
-      const r = await fetch("/api/status/" + jobId);
-      if (r.status === 401) return toLogin();
+      const r = await fetch(BASE + "/api/status/" + jobId);
       const s = await r.json();
       if (!r.ok) return fail(s.error || "Job expired. Start again.");
 
@@ -287,7 +285,7 @@
       } else if (s.state === "done") {
         polling = false; $("prog").className = "prog done"; $("cancel").hidden = true;
         setProgress("Ready", 100, s.filename);
-        const a = $("again"); a.href = "/api/file/" + jobId; a.hidden = false;
+        const a = $("again"); a.href = BASE + "/api/file/" + jobId; a.hidden = false;
         saveBtn.hidden = false; saveBtn.textContent = "Save another quality";
         a.click(); // starts the browser download (streams from the server, no memory use)
         return;
@@ -328,8 +326,7 @@
     checkBtn.disabled = true; $("result").hidden = true; $("plist").hidden = true; $("skel").hidden = false;
     say("Reading playlist…");
     try {
-      const r = await fetch("/api/playlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
-      if (r.status === 401) return toLogin();
+      const r = await fetch(BASE + "/api/playlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Something went wrong.");
       plVideos = d.videos; batchId = null; bpolling = false; saved = new Set(); saveQueue = [];
@@ -378,9 +375,8 @@
     if (!items.length) return say("Select at least one video.", true);
     say("");
     try {
-      const r = await fetch("/api/batch/start", { method: "POST", headers: { "Content-Type": "application/json" },
+      const r = await fetch(BASE + "/api/batch/start", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ items: items.map(({ id, title, quality }) => ({ id, title, quality })) }) });
-      if (r.status === 401) return toLogin();
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Could not start.");
       batchId = d.id; bpolling = true; saved = new Set(); saveQueue = [];
@@ -394,7 +390,7 @@
   let batchRows = [];
 
   function triggerSave(jid) {
-    const a = document.createElement("a"); a.href = "/api/file/" + jid; a.download = ""; a.style.display = "none";
+    const a = document.createElement("a"); a.href = BASE + "/api/file/" + jid; a.download = ""; a.style.display = "none";
     document.body.appendChild(a); a.click(); a.remove();
   }
   function drainSaves() {
@@ -407,8 +403,7 @@
   async function pollBatch(errors) {
     if (!bpolling || !batchId) return;
     try {
-      const r = await fetch("/api/batch/" + batchId);
-      if (r.status === 401) return toLogin();
+      const r = await fetch(BASE + "/api/batch/" + batchId);
       const d = await r.json();
       if (!r.ok) { bpolling = false; setBusy(false); updateCount(); $("bprog").className = "prog fail"; return setBatchProgress("Failed", 100, d.error || "Batch expired."); }
 
@@ -424,7 +419,7 @@
           current = current || it; curPct = 99; tr.hidden = false; bar.style.width = "99.5%"; sub.textContent = "Finishing up…";
         } else if (it.state === "done") {
           done++; tr.hidden = true; row.classList.add("done"); sub.textContent = "Ready ✓";
-          a.href = "/api/file/" + it.jid; a.hidden = false;
+          a.href = BASE + "/api/file/" + it.jid; a.hidden = false;
           if (!saved.has(it.jid)) { saved.add(it.jid); saveQueue.push(it.jid); drainSaves(); }
         } else if (it.state === "error") {
           failed++; tr.hidden = true; row.classList.add("error"); sub.textContent = "Failed: " + (it.error || "download error");
@@ -464,21 +459,30 @@
   $("loadpl").addEventListener("click", () => loadPlaylist(urlInput.value.trim()));
   $("bcancel").addEventListener("click", async () => {
     $("bcancel").disabled = true; setBatchProgress("Cancelling…", 0, "");
-    if (batchId) await fetch("/api/batch/" + batchId + "/cancel", { method: "POST" });
+    if (batchId) await fetch(BASE + "/api/batch/" + batchId + "/cancel", { method: "POST" });
   });
   $("bsaveall").addEventListener("click", () => {
     document.querySelectorAll(".pl-row a.btn:not([hidden])").forEach((a) => { const jid = a.getAttribute("href").split("/").pop(); saveQueue.push(jid); });
     drainSaves();
   });
 
+  // Ask the server how it is set up. In the public version, show the limits.
+  fetch(BASE + "/api/config").then((r) => (r.ok ? r.json() : null)).then((c) => {
+    if (!c) return;
+    if (!c.public) return;
+    publicMode = true;
+    $("limits").textContent = "Free to use, with limits: " + c.per_hour + " saves per hour, videos up to " + c.max_minutes +
+      " minutes and " + c.max_file_mb + " MB, up to " + c.max_height + "p. Playlists are not available.";
+    $("limits").hidden = false;
+  }).catch(() => {});
+
   checkBtn.addEventListener("click", findQualities);
   urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") findQualities(); });
   saveBtn.addEventListener("click", () => { saveBtn.textContent = "Save video"; save(); });
   $("cancel").addEventListener("click", async () => {
     $("cancel").disabled = true; setProgress("Cancelling…", 0, "");
-    if (jobId) await fetch("/api/cancel/" + jobId, { method: "POST" });
+    if (jobId) await fetch(BASE + "/api/cancel/" + jobId, { method: "POST" });
   });
-  $("logout").addEventListener("click", async () => { await fetch("/logout", { method: "POST" }); toLogin(); });
 </script>
 </body>
 </html>
